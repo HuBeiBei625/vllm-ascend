@@ -171,7 +171,7 @@ def _matmul_and_reduce_impl_fake(input_parallel: torch.Tensor, layer_name: str) 
     self = forward_context.no_compile_layers[layer_name]
     num_tokens = input_parallel.size(0)
     if _EXTRA_CTX.flash_comm_v1_enabled:
-        num_tokens = num_tokens // self.tp_size
+        num_tokens = (num_tokens + self.tp_size - 1) // self.tp_size
     output = torch.empty(
         size=(num_tokens, self.output_size_per_partition), device=input_parallel.device, dtype=input_parallel.dtype
     )

@@ -666,6 +666,12 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
             initial_state = ssm_state[non_spec_state_indices_tensor].transpose(-1, -2).contiguous()
+            if has_initial_state is not None and has_initial_state.numel() != initial_state.shape[0]:
+                raise RuntimeError(
+                    "Qwen3.6 GDN PCP split requires PCP-aware recurrent state propagation. "
+                    f"has_initial_state rows: {has_initial_state.numel()}, "
+                    f"state rows: {initial_state.shape[0]}."
+                )
             clear_ssm_states(initial_state, has_initial_state)
             (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
                 q=query_non_spec,

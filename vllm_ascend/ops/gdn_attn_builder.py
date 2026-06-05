@@ -49,6 +49,47 @@ def _stable_argsort_for_npu(tensor: torch.Tensor) -> torch.Tensor:
     return torch.argsort(tensor, stable=True)
 
 
+def _is_pcp_hybrid_attn(common_attn_metadata: CommonAttentionMetadata) -> bool:
+    pcp_metadata = getattr(
+        common_attn_metadata,
+        "prefill_context_parallel_metadata",
+        None,
+    )
+    return bool(pcp_metadata is not None and pcp_metadata.pcp_use_hybrid_attn)
+
+
+def _align_pcp_hybrid_gdn_state_rows(
+    has_initial_state: torch.Tensor,
+    non_spec_state_indices_tensor: torch.Tensor | None,
+    non_spec_query_start_loc_cpu: torch.Tensor | None,
+    common_attn_metadata: CommonAttentionMetadata,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if not _is_pcp_hybrid_attn(common_attn_metadata):
+        return has_initial_state, non_spec_state_indices_tensor
+    if non_spec_state_indices_tensor is None or non_spec_query_start_loc_cpu is None:
+        return has_initial_state, non_spec_state_indices_tensor
+
+    expected_num_rows = non_spec_query_start_loc_cpu.numel() - 1
+    num_initial_state_rows = has_initial_state.numel()
+    num_state_rows = non_spec_state_indices_tensor.numel()
+    if num_initial_state_rows != expected_num_rows:
+        raise RuntimeError(
+            "Qwen3.6 GDN PCP split requires PCP-aware recurrent state propagation."
+        )
+
+    if num_state_rows == expected_num_rows:
+        return has_initial_state, non_spec_state_indices_tensor
+    if num_state_rows < expected_num_rows:
+        raise RuntimeError(
+            "Qwen3.6 GDN PCP split requires PCP-aware recurrent state propagation."
+        )
+
+    return (
+        has_initial_state,
+        non_spec_state_indices_tensor.reshape(-1)[:expected_num_rows].contiguous(),
+    )
+
+
 @dataclass
 class GDNChunkedPrefillMetadata:
     cu_seqlens_cpu: torch.Tensor
@@ -1130,6 +1171,12 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                     non_spec_sequence_indices,
                 )
                 assert non_spec_query_start_loc_cpu is not None
+            has_initial_state, non_spec_state_indices_tensor = _align_pcp_hybrid_gdn_state_rows(
+                has_initial_state,
+                non_spec_state_indices_tensor,
+                non_spec_query_start_loc_cpu,
+                common_attn_metadata,
+            )
             nums_dict, batch_ptr, token_chunk_offset_ptr = compute_causal_conv1d_metadata(
                 non_spec_query_start_loc_cpu,
                 device=query_start_loc.device,

@@ -123,6 +123,7 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
         else:
             raise ValueError("Invalid layer_type")
         hidden_states = self_attention_output
+        residual = torch.ops.vllm.maybe_chunk_residual(hidden_states, residual)
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:

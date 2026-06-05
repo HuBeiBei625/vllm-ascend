@@ -512,7 +512,7 @@ class SequenceRowParallelOp(CustomRowParallelOp):
             output_parallel = self.layer.quant_method.apply(self.layer, x, bias=bias_)
             return tensor_model_parallel_all_reduce(output_parallel)
 
-        pad_size = _EXTRA_CTX.pad_size
+        pad_size = (self.tp_size - input_parallel.shape[0] % self.tp_size) % self.tp_size
         dsa_cp_attn_out = enable_dsa_cp() and ("o_proj" in self.layer.prefix or "wo_b" in self.layer.prefix)
         if pad_size > 0 and not dsa_cp_attn_out:
             x = F.pad(x, (0, 0, 0, pad_size))
