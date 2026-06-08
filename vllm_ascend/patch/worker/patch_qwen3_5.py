@@ -36,6 +36,27 @@ else:
     _GDN_PATCH_TARGET = _GDNBaseCls
 
 
+def _qwen_power_cap_attention(attn_layer, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor):
+    from vllm_ascend.ascend_config import get_ascend_config
+
+    config = get_ascend_config().qwen_power_cap_attn_config
+    if not config.enabled:
+        return None
+
+    helper = getattr(getattr(attn_layer, "impl", None), "qwen_power_cap_forward", None)
+    if helper is None:
+        return None
+
+    return helper(
+        layer=attn_layer,
+        query=query,
+        key=key,
+        value=value,
+        q_heads_per_chunk=config.q_heads_per_chunk,
+        min_prefill_tokens=config.min_prefill_tokens,
+    )
+
+
 class AscendQwen3NextAttention(Qwen3NextAttention):
     def forward(self, positions: torch.Tensor, output: torch.Tensor, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -76,7 +97,9 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
 
             q, k = self.rotary_emb(positions, q, k)
 
-        attn_output = self.attn(q, k, v)
+        attn_output = _qwen_power_cap_attention(self.attn, q, k, v)
+        if attn_output is None:
+            attn_output = self.attn(q, k, v)
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)

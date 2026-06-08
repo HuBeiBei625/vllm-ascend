@@ -53,6 +53,8 @@ class AscendConfig:
 
         profiling_chunk_config = additional_config.get("profiling_chunk_config", {})
         self.profiling_chunk_config = ProfilingChunkConfig(profiling_chunk_config)
+        qwen_power_cap_attn_config = additional_config.get("qwen_power_cap_attn", {})
+        self.qwen_power_cap_attn_config = QwenPowerCapAttentionConfig(qwen_power_cap_attn_config)
         if self.profiling_chunk_config.enabled:
             max_batched = vllm_config.scheduler_config.max_num_batched_tokens
             if max_batched < self.profiling_chunk_config.min_chunk:
@@ -618,6 +620,30 @@ class ProfilingChunkConfig:
             raise ValueError(f"profiling_chunk_config.smooth_factor must be in (0, 1], got {self.smooth_factor}")
         if self.min_chunk <= 0:
             raise ValueError(f"profiling_chunk_config.min_chunk must be positive, got {self.min_chunk}")
+
+
+class QwenPowerCapAttentionConfig:
+    """Qwen-only attention head chunking for power-cap experiments."""
+
+    def __init__(self, config: dict | None = None):
+        if config is None:
+            config = {}
+        self.enabled: bool = bool(config.get("enabled", False))
+        self.q_heads_per_chunk: int = int(config.get("q_heads_per_chunk", 1))
+        self.min_prefill_tokens: int = int(config.get("min_prefill_tokens", 1024))
+        self._validate()
+
+    def _validate(self):
+        if self.q_heads_per_chunk <= 0:
+            raise ValueError(
+                "qwen_power_cap_attn.q_heads_per_chunk must be positive, "
+                f"got {self.q_heads_per_chunk}"
+            )
+        if self.min_prefill_tokens < 0:
+            raise ValueError(
+                "qwen_power_cap_attn.min_prefill_tokens must be non-negative, "
+                f"got {self.min_prefill_tokens}"
+            )
 
 
 class EplbConfig:

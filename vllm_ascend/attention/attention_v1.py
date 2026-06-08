@@ -23,6 +23,7 @@ import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (  # type: ignore
     AttentionBackend,
@@ -1159,6 +1160,147 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
         output[:num_tokens] = attn_output[:num_tokens]
         return output
+
+    def qwen_power_cap_forward(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        q_heads_per_chunk: int,
+        min_prefill_tokens: int,
+    ) -> torch.Tensor | None:
+        if self.__class__ is not AscendAttentionBackendImpl:
+            return None
+        if _EXTRA_CTX.capturing:
+            return None
+        if self.sinks is not None or self.sliding_window is not None:
+            return None
+        if self.enable_c8_quant or self.enable_hamming_sparse:
+            return None
+        if self.attn_type != AttentionType.DECODER:
+            return None
+        if self.num_kv_heads != 1:
+            return None
+        if q_heads_per_chunk <= 0 or q_heads_per_chunk >= self.num_heads:
+            return None
+        if self.num_heads % q_heads_per_chunk != 0:
+            return None
+        if query.dim() != 2 or key.dim() != 2 or value.dim() != 2:
+            return None
+        if query.shape[-1] != self.hidden_size:
+            return None
+        if key.shape[-1] != self.num_kv_heads * self.head_size:
+            return None
+        if value.shape[-1] != self.num_kv_heads * self.head_size:
+            return None
+
+        from vllm.model_executor.layers.attention.attention import get_attention_context
+
+        attn_metadata, attn_layer, kv_cache, _ = get_attention_context(layer.layer_name)
+        if attn_layer is not layer:
+            return None
+        if attn_metadata is None:
+            output = torch.empty_like(query)
+            return output.fill_(0)
+        if attn_metadata.model_runner_type == "pooling" or not attn_metadata.causal:
+            return None
+        if attn_metadata.attn_state not in (
+            AscendAttentionState.PrefillNoCache,
+            AscendAttentionState.ChunkedPrefill,
+        ):
+            return None
+        if attn_metadata.num_decode_tokens != 0 or attn_metadata.num_prefills <= 0:
+            return None
+        if not attn_metadata.actual_seq_lengths_q:
+            return None
+
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        if attn_metadata.num_actual_tokens < min_prefill_tokens:
+            return None
+        if num_tokens > query.shape[0] or attn_metadata.num_actual_tokens > query.shape[0]:
+            return None
+
+        query = query.view(-1, self.num_heads, self.head_size)
+        key = key.view(-1, self.num_kv_heads, self.head_size)
+        value = value.view(-1, self.num_kv_heads, self.head_size)
+        output = torch.empty_like(query)
+
+        if self.key_cache is None and kv_cache is not None:
+            if (
+                isinstance(kv_cache, torch.Tensor)
+                and kv_cache.dim() > 0
+                and kv_cache.shape[0] == 2
+                or isinstance(kv_cache, (list, tuple))
+                and len(kv_cache) >= 2
+            ):
+                self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+
+        query, key, value, output = self.reshape_and_cache(query, key, value, kv_cache, attn_metadata, output)
+        key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
+            key, value, attn_metadata, kv_cache
+        )
+
+        query = query[:num_tokens]
+        if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
+            key = key[:num_tokens]
+            value = value[:num_tokens]
+
+        num_chunks = self.num_heads // q_heads_per_chunk
+        tp_rank = get_tensor_model_parallel_rank()
+        logger.info(
+            "Qwen power-cap attention enabled: layer=%s, tp_rank=%d, "
+            "num_actual_tokens=%d, local_q_heads=%d, local_kv_heads=%d, "
+            "q_heads_per_chunk=%d, num_chunks=%d, q_shape=%s, k_shape=%s, v_shape=%s",
+            layer.layer_name,
+            tp_rank,
+            attn_metadata.num_actual_tokens,
+            self.num_heads,
+            self.num_kv_heads,
+            q_heads_per_chunk,
+            num_chunks,
+            tuple(query.shape),
+            tuple(key.shape),
+            tuple(value.shape),
+        )
+
+        output_chunks = []
+        for chunk_idx, start in enumerate(range(0, self.num_heads, q_heads_per_chunk), start=1):
+            end = start + q_heads_per_chunk
+            query_chunk = query[:, start:end, :]
+            logger.info(
+                "Qwen power-cap attention chunk: layer=%s, tp_rank=%d, "
+                "chunk=%d/%d, local_q_head_range=[%d,%d), q_chunk_shape=%s, "
+                "reuse_k_shape=%s, reuse_v_shape=%s",
+                layer.layer_name,
+                tp_rank,
+                chunk_idx,
+                num_chunks,
+                start,
+                end,
+                tuple(query_chunk.shape),
+                tuple(key.shape),
+                tuple(value.shape),
+            )
+            attn_chunk, _ = torch_npu.npu_fused_infer_attention_score(
+                query=query_chunk,
+                key=key,
+                value=value,
+                atten_mask=attn_metadata.attn_mask,
+                block_table=block_table,
+                input_layout="TND",
+                block_size=block_size,
+                actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
+                num_key_value_heads=self.num_kv_heads,
+                num_heads=q_heads_per_chunk,
+                scale=self.scale,
+                sparse_mode=3,
+            )
+            output_chunks.append(attn_chunk.view(num_tokens, q_heads_per_chunk, self.head_size))
+
+        output[:num_tokens] = torch.cat(output_chunks, dim=1)
+        return output.view(-1, self.hidden_size)
 
     def forward_paged_attention(
         self,
