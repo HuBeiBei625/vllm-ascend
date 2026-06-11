@@ -52,6 +52,7 @@ class TestAscendConfig(TestBase):
 
         ascend_fusion_config = ascend_config.ascend_fusion_config
         self.assertTrue(ascend_fusion_config.fusion_ops_gmmswigluquant)
+        self.assertFalse(ascend_config.qwen36_prefill_ttft_opt.enabled)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
@@ -72,6 +73,7 @@ class TestAscendConfig(TestBase):
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertEqual(ascend_config.eplb_config.num_redundant_experts, 2)
         self.assertTrue(ascend_config.multistream_overlap_shared_expert)
+        self.assertFalse(ascend_config.qwen36_prefill_ttft_opt.enabled)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertFalse(ascend_compilation_config.fuse_norm_quant)
@@ -81,6 +83,50 @@ class TestAscendConfig(TestBase):
 
         ascend_fusion_config = ascend_config.ascend_fusion_config
         self.assertFalse(ascend_fusion_config.fusion_ops_gmmswigluquant)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_qwen36_prefill_ttft_opt_requires_pcp(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "enable_flashcomm1": True,
+            "qwen36_prefill_ttft_opt": {
+                "enabled": True,
+            },
+        }
+
+        with self.assertRaisesRegex(ValueError, "prefill-context-parallel-size"):
+            init_ascend_config(test_vllm_config)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_qwen36_prefill_ttft_opt_requires_flashcomm1(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.parallel_config.prefill_context_parallel_size = 2
+        test_vllm_config.additional_config = {
+            "enable_flashcomm1": False,
+            "qwen36_prefill_ttft_opt": {
+                "enabled": True,
+            },
+        }
+
+        with self.assertRaisesRegex(ValueError, "enable_flashcomm1=true"):
+            init_ascend_config(test_vllm_config)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_qwen36_prefill_ttft_opt_enabled(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.parallel_config.prefill_context_parallel_size = 2
+        test_vllm_config.additional_config = {
+            "enable_flashcomm1": True,
+            "qwen36_prefill_ttft_opt": {
+                "enabled": True,
+            },
+        }
+
+        ascend_config = init_ascend_config(test_vllm_config)
+        self.assertTrue(ascend_config.qwen36_prefill_ttft_opt.enabled)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

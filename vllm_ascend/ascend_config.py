@@ -15,6 +15,7 @@
 # limitations under the License.
 import json
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import logger
@@ -72,6 +73,9 @@ class AscendConfig:
                 "or disable profiling_chunk_config."
             )
 
+        qwen36_prefill_ttft_opt_config = additional_config.get("qwen36_prefill_ttft_opt", {})
+        self.qwen36_prefill_ttft_opt = Qwen36PrefillTTFTOptConfig(qwen36_prefill_ttft_opt_config)
+
         from vllm_ascend import envs as ascend_envs
 
         self.enable_balance_scheduling = self._get_config_value(
@@ -86,6 +90,7 @@ class AscendConfig:
             "VLLM_ASCEND_ENABLE_FLASHCOMM1",
             ascend_envs.VLLM_ASCEND_ENABLE_FLASHCOMM1,
         )
+        self._validate_qwen36_prefill_ttft_opt()
         if self.profiling_chunk_config.enabled and self.enable_balance_scheduling:
             raise ValueError(
                 "profiling_chunk_config and balance scheduling (enable_balance_scheduling) "
@@ -286,6 +291,52 @@ class AscendConfig:
             )
         return env_value
 
+    def _validate_qwen36_prefill_ttft_opt(self) -> None:
+        if not self.qwen36_prefill_ttft_opt.enabled:
+            return
+
+        parallel_config = self.vllm_config.parallel_config
+        if parallel_config.prefill_context_parallel_size <= 1:
+            raise ValueError(
+                "additional_config.qwen36_prefill_ttft_opt.enabled requires "
+                "--prefill-context-parallel-size > 1. For a 4-card setup, "
+                "use --tensor-parallel-size 2 --prefill-context-parallel-size 2."
+            )
+
+        if not self.enable_flashcomm1:
+            raise ValueError(
+                "additional_config.qwen36_prefill_ttft_opt.enabled requires "
+                "additional_config.enable_flashcomm1=true."
+            )
+
+        model_config = getattr(self.vllm_config, "model_config", None)
+        if model_config is None:
+            return
+
+        candidates: list[str] = []
+        for config_name in ("hf_text_config", "hf_config"):
+            hf_config = getattr(model_config, config_name, None)
+            if hf_config is None:
+                continue
+            model_type = getattr(hf_config, "model_type", None)
+            if model_type is not None:
+                candidates.append(str(model_type))
+            architectures = getattr(hf_config, "architectures", None)
+            if architectures is not None:
+                candidates.extend(str(arch) for arch in architectures)
+
+        if candidates and not any(
+            "qwen3_5" in candidate.lower()
+            or "qwen3.5" in candidate.lower()
+            or "qwen3_6" in candidate.lower()
+            or "qwen3.6" in candidate.lower()
+            for candidate in candidates
+        ):
+            raise ValueError(
+                "additional_config.qwen36_prefill_ttft_opt.enabled only supports "
+                "Qwen3.6/Qwen3.5-MoE compatible models."
+            )
+
     def _check_mix_placement(self):
         if self.mix_placement:
             if self.enable_shared_expert_dp or self.multistream_overlap_shared_expert:
@@ -475,6 +526,21 @@ class FinegrainedTPConfig:
                 raise AssertionError("lmhead_tensor_parallel_size must divide by data_parallel_size.")
         if any(size > 0 for size in module_tp_sizes) and enabled_configs:
             logger.info("finegrained_tp_config enabled: %s", ", ".join(enabled_configs))
+
+
+@dataclass
+class Qwen36PrefillTTFTOptConfig:
+    enabled: bool = False
+
+    def __init__(self, config: dict[str, Any] | None):
+        config = config or {}
+        if not isinstance(config, dict):
+            raise ValueError(
+                "additional_config.qwen36_prefill_ttft_opt must be a dict, "
+                f"got {type(config).__name__}."
+            )
+
+        self.enabled = bool(config.get("enabled", False))
 
 
 class AscendCompilationConfig:
