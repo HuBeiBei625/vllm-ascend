@@ -115,6 +115,7 @@
 import argparse
 import asyncio
 import base64
+import copy
 import functools
 import heapq
 import ipaddress
@@ -161,6 +162,15 @@ class InstanceInfo:
     decoder_score: float
     decoder_host: str
     decoder_port: int
+
+
+@dataclass
+class StreamChunkInfo:
+    """Protocol-independent details needed by the PD retry path."""
+
+    content: str = ""
+    recomputed: bool = False
+    completion_tokens: int = 0
 
 
 TAINT_PRIORITY = 1e15
@@ -787,7 +797,12 @@ def auth_headers(request_id: str) -> dict[str, str]:
     }
 
 
-def build_prefill_request(req_data: dict) -> dict:
+def build_prefill_request(api: str, req_data: dict) -> dict:
+    """Build the one-token, non-streaming request sent to the prefiller.
+
+    The three supported APIs use different names for their output token
+    budget.  In particular, ``max_tokens`` is not a Responses API field.
+    """
     payload = req_data.copy()
     payload["kv_transfer_params"] = {
         "do_remote_decode": True,
@@ -798,12 +813,135 @@ def build_prefill_request(req_data: dict) -> dict:
         "remote_port": None,
     }
     payload["stream"] = False
-    payload["max_tokens"] = 1
-    payload["min_tokens"] = 1
-    if "max_completion_tokens" in payload:
-        payload["max_completion_tokens"] = 1
+    if api == "/responses":
+        payload.pop("max_tokens", None)
+        payload.pop("min_tokens", None)
+        payload.pop("max_completion_tokens", None)
+        payload["max_output_tokens"] = 1
+    else:
+        payload["max_tokens"] = 1
+        if api != "/messages":
+            payload["min_tokens"] = 1
+            if "max_completion_tokens" in payload:
+                payload["max_completion_tokens"] = 1
+        else:
+            payload.pop("min_tokens", None)
+            payload.pop("max_completion_tokens", None)
     payload.pop("stream_options", None)
     return payload
+
+
+def _response_token_budget_key(api: str) -> str:
+    return "max_output_tokens" if api == "/responses" else "max_tokens"
+
+
+def build_recomputed_request(api: str, original_request: dict, generated_text: str, completion_tokens: int) -> dict:
+    """Continue a request after the decoder reports ``stop_reason=recomputed``.
+
+    This intentionally starts from the original request on every retry, so a
+    second recomputation cannot append the previously generated text twice.
+    """
+    payload = copy.deepcopy(original_request)
+    budget_key = _response_token_budget_key(api)
+    original_budget = payload.get(budget_key, 16)
+    payload[budget_key] = max(1, original_budget - completion_tokens)
+
+    if api == "/completions":
+        payload["prompt"] = f"{payload.get('prompt', '')}{generated_text}"
+    elif api == "/chat/completions":
+        messages = payload.get("messages", [])
+        if messages:
+            # Keep the historical behaviour for this endpoint.
+            content = messages[0].get("content", "")
+            if isinstance(content, str):
+                messages[0]["content"] = content + generated_text
+            else:
+                messages.append({"role": "assistant", "content": generated_text})
+    elif api == "/messages":
+        # Anthropic content may be a string or content-block list. Appending a
+        # new assistant message preserves both forms without lossy conversion.
+        payload.setdefault("messages", []).append({"role": "assistant", "content": generated_text})
+    elif api == "/responses":
+        response_input = payload.get("input", "")
+        if isinstance(response_input, str):
+            payload["input"] = response_input + generated_text
+        elif isinstance(response_input, list):
+            response_input.append(
+                {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": generated_text}],
+                }
+            )
+    return payload
+
+
+def parse_stream_chunk(api: str, chunk: bytes) -> StreamChunkInfo:
+    """Extract text and recompute metadata without changing proxy payloads.
+
+    Backend byte chunks are passed through verbatim; this parser is only used
+    to maintain PD retry state. It accepts both ``data:``-only chunks and
+    normal SSE chunks containing an ``event:`` line.
+    """
+    try:
+        text = chunk.decode("utf-8")
+    except UnicodeDecodeError:
+        return StreamChunkInfo()
+
+    data_lines = [line.removeprefix("data: ") for line in text.splitlines() if line.startswith("data: ")]
+    if not data_lines:
+        data_lines = [text.strip()]
+
+    result = StreamChunkInfo()
+    for data in data_lines:
+        if not data or data == "[DONE]":
+            continue
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+
+        usage = event.get("usage") or {}
+        if api == "/messages":
+            delta = event.get("delta") or {}
+            result.content += delta.get("text") or ""
+            result.recomputed = result.recomputed or (
+                delta.get("stop_reason") == "recomputed" or event.get("stop_reason") == "recomputed"
+            )
+            result.completion_tokens += usage.get("output_tokens", 0)
+        elif api == "/responses":
+            if event.get("type") == "response.output_text.delta":
+                result.content += event.get("delta") or ""
+            response = event.get("response") or {}
+            result.recomputed = result.recomputed or (
+                response.get("stop_reason") == "recomputed" or event.get("stop_reason") == "recomputed"
+            )
+            result.completion_tokens += (usage or response.get("usage") or {}).get("output_tokens", 0)
+        else:
+            choices = event.get("choices") or []
+            if choices:
+                choice = choices[0]
+                delta = choice.get("delta") or {}
+                message = choice.get("message") or {}
+                result.content += delta.get("content") or message.get("content") or choice.get("text") or ""
+                result.recomputed = result.recomputed or choice.get("stop_reason") == "recomputed"
+            result.completion_tokens += usage.get("completion_tokens", 0)
+    return result
+
+
+def replace_openai_nonstream_content(api: str, chunk: bytes, generated_text: str) -> bytes:
+    """Preserve the existing non-streaming OpenAI retry response behaviour."""
+    if api not in {"/completions", "/chat/completions"}:
+        return chunk
+    try:
+        event = json.loads(chunk.decode("utf-8"))
+        choice = event["choices"][0]
+        if api == "/chat/completions":
+            choice["message"]["content"] = generated_text
+        else:
+            choice["text"] = generated_text
+        return json.dumps(event).encode("utf-8")
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError):
+        return chunk
 
 
 async def send_request_to_service(
@@ -814,7 +952,7 @@ async def send_request_to_service(
     max_retries: int = 3,
     base_delay: float = 0.2,
 ):
-    req_data = build_prefill_request(req_data)
+    req_data = build_prefill_request(endpoint, req_data)
     headers = auth_headers(request_id)
     last_exc = None
     for attempt in range(1, max_retries + 1):
@@ -964,24 +1102,22 @@ async def handle_completions_impl(api: str, request: Request):
     request_released = False
     try:
         req_data = await request.json()
+        original_req_data = copy.deepcopy(req_data)
         req_body = await request.body()
         request_length = len(req_body)
         instance_info = await assign_instances(api, req_data, request_length, is_initial_request=True)
         stream_flag = bool(req_data.get("stream", False))
-        chat_flag = "messages" in req_data
-
-        if "prompt" in req_data:
-            origin_prompt = req_data["prompt"]
-        elif chat_flag:
+        # Keep the established Chat Completions recompute path byte-for-byte
+        # equivalent in behaviour. This is the proxy's highest-volume API.
+        if api == "/chat/completions":
             messages = req_data["messages"]
             origin_prompt = messages[0].get("content", "")
-        else:
-            origin_prompt = ""
-        origin_max_tokens = req_data.get("max_tokens", 16)
+            origin_max_tokens = req_data.get("max_tokens", 16)
 
         async def generate_stream():
             nonlocal instance_info
             nonlocal request_released
+            nonlocal req_data
             generated_token = ""
             released_kv = False
             retry_count = 0
@@ -1010,58 +1146,76 @@ async def handle_completions_impl(api: str, request: Request):
                     ):
                         if not released_kv and chunk:
                             await release_prefill_kv_once()
-                        try:
-                            chunk_str = chunk.decode("utf-8").strip()
-                        except UnicodeDecodeError:
-                            logger.debug("Skipping chunk: %s", chunk)
-                            yield chunk
-                            continue
-                        if not chunk_str:
-                            continue
-                        if chunk_str.startswith("data: "):
-                            chunk_str = chunk_str[len("data: ") :]
-                        try:
-                            chunk_json = json.loads(chunk_str)
-                        except json.JSONDecodeError:
-                            logger.debug("Skipping chunk: %s", chunk_str)
-                            yield chunk
-                            continue
-                        choices = chunk_json.get("choices", [])
-                        if not choices:
-                            yield chunk
-                            continue
+                        if api == "/chat/completions":
+                            try:
+                                chunk_str = chunk.decode("utf-8").strip()
+                            except UnicodeDecodeError:
+                                logger.debug("Skipping chunk: %s", chunk)
+                                yield chunk
+                                continue
+                            if not chunk_str:
+                                continue
+                            if chunk_str.startswith("data: "):
+                                chunk_str = chunk_str[len("data: ") :]
+                            try:
+                                chunk_json = json.loads(chunk_str)
+                            except json.JSONDecodeError:
+                                logger.debug("Skipping chunk: %s", chunk_str)
+                                yield chunk
+                                continue
+                            choices = chunk_json.get("choices", [])
+                            if not choices:
+                                yield chunk
+                                continue
 
-                        choice = choices[0]
-                        delta = choice.get("delta") or {}
-                        message = choice.get("message") or {}
-                        content = delta.get("content") or message.get("content") or choice.get("text") or ""
-                        generated_token += content
+                            choice = choices[0]
+                            delta = choice.get("delta") or {}
+                            message = choice.get("message") or {}
+                            content = delta.get("content") or message.get("content") or choice.get("text") or ""
+                            generated_token += content
 
-                        stop_reason = choice.get("stop_reason")
-                        usage = chunk_json.get("usage", {})
-                        completion_tokens = (
-                            (completion_tokens + 1)
-                            if stream_flag
-                            else (completion_tokens + usage.get("completion_tokens", 0))
-                        )
-                        if stop_reason == "recomputed":
+                            stop_reason = choice.get("stop_reason")
+                            usage = chunk_json.get("usage", {})
+                            completion_tokens = (
+                                (completion_tokens + 1)
+                                if stream_flag
+                                else (completion_tokens + usage.get("completion_tokens", 0))
+                            )
+                            if stop_reason == "recomputed":
+                                retry = True
+                                retry_count += 1
+                                messages[0]["content"] = origin_prompt + generated_token
+                                req_data["max_tokens"] = origin_max_tokens - completion_tokens + retry_count
+                                tmp_request_length = len(json.dumps(req_data).encode("utf-8"))
+                                instance_info = await reassign_instances(
+                                    api, req_data, tmp_request_length, instance_info
+                                )
+                                released_kv = False
+                                break
+                            if retry_count > 0 and not stream_flag:
+                                choice["message"]["content"] = generated_token
+                                chunk = json.dumps(chunk_json).encode("utf-8")
+                            yield chunk
+                            continue
+                        chunk_info = parse_stream_chunk(api, chunk)
+                        generated_token += chunk_info.content
+                        completion_tokens += chunk_info.completion_tokens
+                        # Some streaming protocols omit usage until their final
+                        # event. Retain the old conservative per-chunk estimate.
+                        if stream_flag and chunk_info.content and not chunk_info.completion_tokens:
+                            completion_tokens += 1
+                        if chunk_info.recomputed:
                             retry = True
                             retry_count += 1
-                            if chat_flag:
-                                messages[0]["content"] = origin_prompt + generated_token
-                            else:
-                                req_data["prompt"] = origin_prompt + generated_token
-                            req_data["max_tokens"] = origin_max_tokens - completion_tokens + retry_count
+                            req_data = build_recomputed_request(
+                                api, original_req_data, generated_token, completion_tokens
+                            )
                             tmp_request_length = len(json.dumps(req_data).encode("utf-8"))
                             instance_info = await reassign_instances(api, req_data, tmp_request_length, instance_info)
                             released_kv = False
                             break
                         if retry_count > 0 and not stream_flag:
-                            if chat_flag:
-                                choice["message"]["content"] = generated_token
-                            else:
-                                choice["text"] = generated_token
-                            chunk = json.dumps(chunk_json).encode("utf-8")
+                            chunk = replace_openai_nonstream_content(api, chunk, generated_token)
                         yield chunk
             except asyncio.CancelledError:
                 logger.warning(
@@ -1153,6 +1307,18 @@ async def handle_completions(request: Request):
 @with_cancellation
 async def handle_chat_completions(request: Request):
     return await handle_completions_impl("/chat/completions", request)
+
+
+@app.post("/v1/messages")
+@with_cancellation
+async def handle_messages(request: Request):
+    return await handle_completions_impl("/messages", request)
+
+
+@app.post("/v1/responses")
+@with_cancellation
+async def handle_responses(request: Request):
+    return await handle_completions_impl("/responses", request)
 
 
 @app.post("/reset_prefix_cache")
