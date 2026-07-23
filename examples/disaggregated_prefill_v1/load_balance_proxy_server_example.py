@@ -140,6 +140,76 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 logger = logging.getLogger(__name__)
 
+
+# Request dump configuration. Both paths may be overridden for deployments
+# that do not run the proxy from its example directory.
+REQ_LOG_DIR = os.environ.get("PROXY_REQ_LOG_DIR", "./request_logs")
+REQ_LOG_CONFIG = os.environ.get("PROXY_LOG_CONFIG", "./proxy_log_config.json")
+_REQ_LOG_CACHE_TTL = 300
+_req_log_cache: tuple[float, dict[str, Any]] = (0.0, {})
+
+
+def _load_log_config() -> dict[str, Any]:
+    """Load the optional dump configuration, caching it for five minutes."""
+    global _req_log_cache
+    now = time.time()
+    last_check, cached_config = _req_log_cache
+    if now - last_check < _REQ_LOG_CACHE_TTL:
+        return cached_config
+    try:
+        with open(REQ_LOG_CONFIG, encoding="utf-8") as config_file:
+            config = json.load(config_file)
+        if not isinstance(config, dict):
+            config = {}
+    except (OSError, json.JSONDecodeError):
+        config = {}
+    _req_log_cache = (now, config)
+    return config
+
+
+def _should_save_tag(tag: str) -> bool:
+    return bool(_load_log_config().get(f"save_{tag}", False))
+
+
+def _write_dump(payload: Any, tag: str, request_id: str) -> str:
+    """Write a JSON dump without affecting inference when logging fails."""
+    try:
+        os.makedirs(REQ_LOG_DIR, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filepath = os.path.join(REQ_LOG_DIR, f"{timestamp}_{request_id}_{tag}.json")
+        with open(filepath, "w", encoding="utf-8") as dump_file:
+            json.dump(payload, dump_file, ensure_ascii=False, indent=2)
+        logger.info("Request dump saved: %s (%d bytes)", filepath, os.path.getsize(filepath))
+        return filepath
+    except Exception as exc:
+        logger.error("Failed to save request dump [%s]: %s", tag, exc)
+        return ""
+
+
+def _save_client_request(req_data: Any, endpoint: str, request_id: str) -> str:
+    """Save the original incoming request when ``save_messages`` is enabled."""
+    if not _should_save_tag("messages"):
+        return ""
+    return _write_dump(req_data, f"{endpoint}_request", request_id)
+
+
+def _save_prefill_request(req_data: Any, request_id: str) -> str:
+    if not _should_save_tag("prefill"):
+        return ""
+    return _write_dump(req_data, "prefill", request_id)
+
+
+def _save_client_response(req_data: Any, response_text: str, endpoint: str, request_id: str) -> str:
+    """Save the original request and raw downstream response when enabled."""
+    if not _should_save_tag("responses"):
+        return ""
+    return _write_dump(
+        {"request": req_data, "response_sse": response_text},
+        f"{endpoint}_response",
+        request_id,
+    )
+
+
 try:
     import uvloop  # type: ignore[import-not-found]
 
@@ -953,6 +1023,7 @@ async def send_request_to_service(
     base_delay: float = 0.2,
 ):
     req_data = build_prefill_request(endpoint, req_data)
+    _save_prefill_request(req_data, request_id)
     headers = auth_headers(request_id)
     last_exc = None
     for attempt in range(1, max_retries + 1):
@@ -1103,6 +1174,8 @@ async def handle_completions_impl(api: str, request: Request):
     try:
         req_data = await request.json()
         original_req_data = copy.deepcopy(req_data)
+        log_request_id = str(uuid.uuid4())[:8]
+        _save_client_request(original_req_data, api.strip("/").replace("/", "_"), log_request_id)
         req_body = await request.body()
         request_length = len(req_body)
         instance_info = await assign_instances(api, req_data, request_length, is_initial_request=True)
@@ -1123,6 +1196,8 @@ async def handle_completions_impl(api: str, request: Request):
             retry_count = 0
             retry = True
             completion_tokens = 0
+            save_response = _should_save_tag("responses")
+            response_chunks: list[bytes] = []
 
             async def release_prefill_kv_once() -> None:
                 nonlocal released_kv
@@ -1144,6 +1219,8 @@ async def handle_completions_impl(api: str, request: Request):
                         max_retries=args.max_retries,
                         base_delay=args.retry_delay,
                     ):
+                        if save_response:
+                            response_chunks.append(chunk)
                         if not released_kv and chunk:
                             await release_prefill_kv_once()
                         if api == "/chat/completions":
@@ -1237,6 +1314,13 @@ async def handle_completions_impl(api: str, request: Request):
                 await _finish_instance(runtime, instance_info, release_prefill_kv=not released_kv)
                 released_kv = True
                 request_released = True
+                if save_response:
+                    _save_client_response(
+                        original_req_data,
+                        b"".join(response_chunks).decode("utf-8", errors="replace"),
+                        api.strip("/").replace("/", "_"),
+                        log_request_id,
+                    )
 
         media_type = "text/event-stream; charset=utf-8" if stream_flag else "application/json"
         return StreamingResponse(generate_stream(), media_type=media_type)
